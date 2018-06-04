@@ -137,6 +137,7 @@ client *createClient(int fd) {
     c->bpop.keys = dictCreate(&objectKeyHeapPointerValueDictType,NULL);
     c->bpop.target = NULL;
     c->bpop.xread_group = NULL;
+    c->bpop.xread_consumer = NULL;
     c->bpop.numreplicas = 0;
     c->bpop.reploffset = 0;
     c->woff = 0;
@@ -233,62 +234,6 @@ int _addReplyToBuffer(client *c, const char *s, size_t len) {
     return C_OK;
 }
 
-void _addReplyObjectToList(client *c, robj *o) {
-    if (c->flags & CLIENT_CLOSE_AFTER_REPLY) return;
-
-    if (listLength(c->reply) == 0) {
-        sds s = sdsdup(o->ptr);
-        listAddNodeTail(c->reply,s);
-        c->reply_bytes += sdslen(s);
-    } else {
-        listNode *ln = listLast(c->reply);
-        sds tail = listNodeValue(ln);
-
-        /* Append to this object when possible. If tail == NULL it was
-         * set via addDeferredMultiBulkLength(). */
-        if (tail && sdslen(tail)+sdslen(o->ptr) <= PROTO_REPLY_CHUNK_BYTES) {
-            tail = sdscatsds(tail,o->ptr);
-            listNodeValue(ln) = tail;
-            c->reply_bytes += sdslen(o->ptr);
-        } else {
-            sds s = sdsdup(o->ptr);
-            listAddNodeTail(c->reply,s);
-            c->reply_bytes += sdslen(s);
-        }
-    }
-    asyncCloseClientOnOutputBufferLimitReached(c);
-}
-
-/* This method takes responsibility over the sds. When it is no longer
- * needed it will be free'd, otherwise it ends up in a robj. */
-void _addReplySdsToList(client *c, sds s) {
-    if (c->flags & CLIENT_CLOSE_AFTER_REPLY) {
-        sdsfree(s);
-        return;
-    }
-
-    if (listLength(c->reply) == 0) {
-        listAddNodeTail(c->reply,s);
-        c->reply_bytes += sdslen(s);
-    } else {
-        listNode *ln = listLast(c->reply);
-        sds tail = listNodeValue(ln);
-
-        /* Append to this object when possible. If tail == NULL it was
-         * set via addDeferredMultiBulkLength(). */
-        if (tail && sdslen(tail)+sdslen(s) <= PROTO_REPLY_CHUNK_BYTES) {
-            tail = sdscatsds(tail,s);
-            listNodeValue(ln) = tail;
-            c->reply_bytes += sdslen(s);
-            sdsfree(s);
-        } else {
-            listAddNodeTail(c->reply,s);
-            c->reply_bytes += sdslen(s);
-        }
-    }
-    asyncCloseClientOnOutputBufferLimitReached(c);
-}
-
 void _addReplyStringToList(client *c, const char *s, size_t len) {
     if (c->flags & CLIENT_CLOSE_AFTER_REPLY) return;
 
@@ -320,54 +265,37 @@ void _addReplyStringToList(client *c, const char *s, size_t len) {
  * The following functions are the ones that commands implementations will call.
  * -------------------------------------------------------------------------- */
 
+/* Add the object 'obj' string representation to the client output buffer. */
 void addReply(client *c, robj *obj) {
     if (prepareClientToWrite(c) != C_OK) return;
 
-    /* This is an important place where we can avoid copy-on-write
-     * when there is a saving child running, avoiding touching the
-     * refcount field of the object if it's not needed.
-     *
-     * If the encoding is RAW and there is room in the static buffer
-     * we'll be able to send the object to the client without
-     * messing with its page. */
     if (sdsEncodedObject(obj)) {
         if (_addReplyToBuffer(c,obj->ptr,sdslen(obj->ptr)) != C_OK)
-            _addReplyObjectToList(c,obj);
+            _addReplyStringToList(c,obj->ptr,sdslen(obj->ptr));
     } else if (obj->encoding == OBJ_ENCODING_INT) {
-        /* Optimization: if there is room in the static buffer for 32 bytes
-         * (more than the max chars a 64 bit integer can take as string) we
-         * avoid decoding the object and go for the lower level approach. */
-        if (listLength(c->reply) == 0 && (sizeof(c->buf) - c->bufpos) >= 32) {
-            char buf[32];
-            int len;
-
-            len = ll2string(buf,sizeof(buf),(long)obj->ptr);
-            if (_addReplyToBuffer(c,buf,len) == C_OK)
-                return;
-            /* else... continue with the normal code path, but should never
-             * happen actually since we verified there is room. */
-        }
-        obj = getDecodedObject(obj);
-        if (_addReplyToBuffer(c,obj->ptr,sdslen(obj->ptr)) != C_OK)
-            _addReplyObjectToList(c,obj);
-        decrRefCount(obj);
+        /* For integer encoded strings we just convert it into a string
+         * using our optimized function, and attach the resulting string
+         * to the output buffer. */
+        char buf[32];
+        size_t len = ll2string(buf,sizeof(buf),(long)obj->ptr);
+        if (_addReplyToBuffer(c,buf,len) != C_OK)
+            _addReplyStringToList(c,buf,len);
     } else {
         serverPanic("Wrong obj->encoding in addReply()");
     }
 }
 
+/* Add the SDS 's' string to the client output buffer, as a side effect
+ * the SDS string is freed. */
 void addReplySds(client *c, sds s) {
     if (prepareClientToWrite(c) != C_OK) {
         /* The caller expects the sds to be free'd. */
         sdsfree(s);
         return;
     }
-    if (_addReplyToBuffer(c,s,sdslen(s)) == C_OK) {
-        sdsfree(s);
-    } else {
-        /* This method free's the sds when it is no longer needed. */
-        _addReplySdsToList(c,s);
-    }
+    if (_addReplyToBuffer(c,s,sdslen(s)) != C_OK)
+        _addReplyStringToList(c,s,sdslen(s));
+    sdsfree(s);
 }
 
 /* This low level function just adds whatever protocol you send it to the
@@ -384,10 +312,26 @@ void addReplyString(client *c, const char *s, size_t len) {
         _addReplyStringToList(c,s,len);
 }
 
+/* Low level function called by the addReplyError...() functions.
+ * It emits the protocol for a Redis error, in the form:
+ *
+ * -ERRORCODE Error Message<CR><LF>
+ *
+ * If the error code is already passed in the string 's', the error
+ * code provided is used, otherwise the string "-ERR " for the generic
+ * error code is automatically added. */
 void addReplyErrorLength(client *c, const char *s, size_t len) {
-    addReplyString(c,"-ERR ",5);
+    /* If the string already starts with "-..." then the error code
+     * is provided by the caller. Otherwise we use "-ERR". */
+    if (!len || s[0] != '-') addReplyString(c,"-ERR ",5);
     addReplyString(c,s,len);
     addReplyString(c,"\r\n",2);
+    if (c->flags & CLIENT_MASTER) {
+        char *cmdname = c->lastcmd ? c->lastcmd->name : "<unknown>";
+        serverLog(LL_WARNING,"== CRITICAL == This slave is sending an error "
+                             "to its master: '%s' after processing the command "
+                             "'%s'", s, cmdname);
+    }
 }
 
 void addReplyError(client *c, const char *err) {
@@ -1038,13 +982,25 @@ int handleClientsWithPendingWrites(void) {
         /* Try to write buffers to the client socket. */
         if (writeToClient(c->fd,c,0) == C_ERR) continue;
 
-        /* If there is nothing left, do nothing. Otherwise install
-         * the write handler. */
-        if (clientHasPendingReplies(c) &&
-            aeCreateFileEvent(server.el, c->fd, AE_WRITABLE,
+        /* If after the synchronous writes above we still have data to
+         * output to the client, we need to install the writable handler. */
+        if (clientHasPendingReplies(c)) {
+            int ae_flags = AE_WRITABLE;
+            /* For the fsync=always policy, we want that a given FD is never
+             * served for reading and writing in the same event loop iteration,
+             * so that in the middle of receiving the query, and serving it
+             * to the client, we'll call beforeSleep() that will do the
+             * actual fsync of AOF to disk. AE_BARRIER ensures that. */
+            if (server.aof_state == AOF_ON &&
+                server.aof_fsync == AOF_FSYNC_ALWAYS)
+            {
+                ae_flags |= AE_BARRIER;
+            }
+            if (aeCreateFileEvent(server.el, c->fd, ae_flags,
                 sendReplyToClient, c) == AE_ERR)
-        {
-            freeClientAsync(c);
+            {
+                    freeClientAsync(c);
+            }
         }
     }
     return processed;
@@ -1300,7 +1256,7 @@ int processMultibulkBuffer(client *c) {
                 sdsIncrLen(c->querybuf,-2); /* remove CRLF */
                 /* Assume that if we saw a fat argument we'll see another one
                  * likely... */
-                c->querybuf = sdsnewlen(NULL,c->bulklen+2);
+                c->querybuf = sdsnewlen(SDS_NOINIT,c->bulklen+2);
                 sdsclear(c->querybuf);
                 pos = 0;
             } else {
@@ -1579,7 +1535,7 @@ sds getAllClientsInfoString(void) {
     listNode *ln;
     listIter li;
     client *client;
-    sds o = sdsnewlen(NULL,200*listLength(server.clients));
+    sds o = sdsnewlen(SDS_NOINIT,200*listLength(server.clients));
     sdsclear(o);
     listRewind(server.clients,&li);
     while ((ln = listNext(&li)) != NULL) {

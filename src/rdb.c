@@ -75,6 +75,18 @@ static int rdbWriteRaw(rio *rdb, void *p, size_t len) {
     return len;
 }
 
+/* This is just a wrapper for the low level function rioRead() that will
+ * automatically abort if it is not possible to read the specified amount
+ * of bytes. */
+void rdbLoadRaw(rio *rdb, void *buf, uint64_t len) {
+    if (rioRead(rdb,buf,len) == 0) {
+        rdbExitReportCorruptRDB(
+            "Impossible to read %llu bytes in rdbLoadRaw()",
+            (unsigned long long) len);
+        return; /* Not reached. */
+    }
+}
+
 int rdbSaveType(rio *rdb, unsigned char type) {
     return rdbWriteRaw(rdb,&type,1);
 }
@@ -90,7 +102,7 @@ int rdbLoadType(rio *rdb) {
 
 time_t rdbLoadTime(rio *rdb) {
     int32_t t32;
-    if (rioRead(rdb,&t32,4) == 0) return -1;
+    rdbLoadRaw(rdb,&t32,4);
     return (time_t)t32;
 }
 
@@ -101,7 +113,7 @@ int rdbSaveMillisecondTime(rio *rdb, long long t) {
 
 long long rdbLoadMillisecondTime(rio *rdb) {
     int64_t t64;
-    if (rioRead(rdb,&t64,8) == 0) return -1;
+    rdbLoadRaw(rdb,&t64,8);
     return (long long)t64;
 }
 
@@ -255,7 +267,7 @@ void *rdbLoadIntegerObject(rio *rdb, int enctype, int flags, size_t *lenptr) {
         char buf[LONG_STR_SIZE], *p;
         int len = ll2string(buf,sizeof(buf),val);
         if (lenptr) *lenptr = len;
-        p = plain ? zmalloc(len) : sdsnewlen(NULL,len);
+        p = plain ? zmalloc(len) : sdsnewlen(SDS_NOINIT,len);
         memcpy(p,buf,len);
         return p;
     } else if (encode) {
@@ -344,10 +356,10 @@ void *rdbLoadLzfStringObject(rio *rdb, int flags, size_t *lenptr) {
     /* Allocate our target according to the uncompressed size. */
     if (plain) {
         val = zmalloc(len);
-        if (lenptr) *lenptr = len;
     } else {
-        val = sdsnewlen(NULL,len);
+        val = sdsnewlen(SDS_NOINIT,len);
     }
+    if (lenptr) *lenptr = len;
 
     /* Load the compressed representation and uncompress it to target. */
     if (rioRead(rdb,c,clen) == 0) goto err;
@@ -472,7 +484,7 @@ void *rdbGenericLoadStringObject(rio *rdb, int flags, size_t *lenptr) {
 
     if (len == RDB_LENERR) return NULL;
     if (plain || sds) {
-        void *buf = plain ? zmalloc(len) : sdsnewlen(NULL,len);
+        void *buf = plain ? zmalloc(len) : sdsnewlen(SDS_NOINIT,len);
         if (lenptr) *lenptr = len;
         if (len && rioRead(rdb,buf,len) == 0) {
             if (plain)
@@ -483,8 +495,8 @@ void *rdbGenericLoadStringObject(rio *rdb, int flags, size_t *lenptr) {
         }
         return buf;
     } else {
-        robj *o = encode ? createStringObject(NULL,len) :
-                           createRawStringObject(NULL,len);
+        robj *o = encode ? createStringObject(SDS_NOINIT,len) :
+                           createRawStringObject(SDS_NOINIT,len);
         if (len && rioRead(rdb,o->ptr,len) == 0) {
             decrRefCount(o);
             return NULL;
@@ -642,7 +654,86 @@ int rdbLoadObjectType(rio *rdb) {
     return type;
 }
 
-/* Save a Redis object. Returns -1 on error, number of bytes written on success. */
+/* This helper function serializes a consumer group Pending Entries List (PEL)
+ * into the RDB file. The 'nacks' argument tells the function if also persist
+ * the informations about the not acknowledged message, or if to persist
+ * just the IDs: this is useful because for the global consumer group PEL
+ * we serialized the NACKs as well, but when serializing the local consumer
+ * PELs we just add the ID, that will be resolved inside the global PEL to
+ * put a reference to the same structure. */
+ssize_t rdbSaveStreamPEL(rio *rdb, rax *pel, int nacks) {
+    ssize_t n, nwritten = 0;
+
+    /* Number of entries in the PEL. */
+    if ((n = rdbSaveLen(rdb,raxSize(pel))) == -1) return -1;
+    nwritten += n;
+
+    /* Save each entry. */
+    raxIterator ri;
+    raxStart(&ri,pel);
+    raxSeek(&ri,"^",NULL,0);
+    while(raxNext(&ri)) {
+        /* We store IDs in raw form as 128 big big endian numbers, like
+         * they are inside the radix tree key. */
+        if ((n = rdbWriteRaw(rdb,ri.key,sizeof(streamID))) == -1) return -1;
+        nwritten += n;
+
+        if (nacks) {
+            streamNACK *nack = ri.data;
+            if ((n = rdbSaveMillisecondTime(rdb,nack->delivery_time)) == -1)
+                return -1;
+            nwritten += n;
+            if ((n = rdbSaveLen(rdb,nack->delivery_count)) == -1) return -1;
+            nwritten += n;
+            /* We don't save the consumer name: we'll save the pending IDs
+             * for each consumer in the consumer PEL, and resolve the consumer
+             * at loading time. */
+        }
+    }
+    raxStop(&ri);
+    return nwritten;
+}
+
+/* Serialize the consumers of a stream consumer group into the RDB. Helper
+ * function for the stream data type serialization. What we do here is to
+ * persist the consumer metadata, and it's PEL, for each consumer. */
+size_t rdbSaveStreamConsumers(rio *rdb, streamCG *cg) {
+    ssize_t n, nwritten = 0;
+
+    /* Number of consumers in this consumer group. */
+    if ((n = rdbSaveLen(rdb,raxSize(cg->consumers))) == -1) return -1;
+    nwritten += n;
+
+    /* Save each consumer. */
+    raxIterator ri;
+    raxStart(&ri,cg->consumers);
+    raxSeek(&ri,"^",NULL,0);
+    while(raxNext(&ri)) {
+        streamConsumer *consumer = ri.data;
+
+        /* Consumer name. */
+        if ((n = rdbSaveRawString(rdb,ri.key,ri.key_len)) == -1) return -1;
+        nwritten += n;
+
+        /* Last seen time. */
+        if ((n = rdbSaveMillisecondTime(rdb,consumer->seen_time)) == -1)
+            return -1;
+        nwritten += n;
+
+        /* Consumer PEL, without the ACKs (see last parameter of the function
+         * passed with value of 0), at loading time we'll lookup the ID
+         * in the consumer group global PEL and will put a reference in the
+         * consumer local PEL. */
+        if ((n = rdbSaveStreamPEL(rdb,consumer->pel,0)) == -1)
+            return -1;
+        nwritten += n;
+    }
+    raxStop(&ri);
+    return nwritten;
+}
+
+/* Save a Redis object.
+ * Returns -1 on error, number of bytes written on success. */
 ssize_t rdbSaveObject(rio *rdb, robj *o) {
     ssize_t n = 0, nwritten = 0;
 
@@ -681,13 +772,20 @@ ssize_t rdbSaveObject(rio *rdb, robj *o) {
             dictIterator *di = dictGetIterator(set);
             dictEntry *de;
 
-            if ((n = rdbSaveLen(rdb,dictSize(set))) == -1) return -1;
+            if ((n = rdbSaveLen(rdb,dictSize(set))) == -1) {
+                dictReleaseIterator(di);
+                return -1;
+            }
             nwritten += n;
 
             while((de = dictNext(di)) != NULL) {
                 sds ele = dictGetKey(de);
                 if ((n = rdbSaveRawString(rdb,(unsigned char*)ele,sdslen(ele)))
-                    == -1) return -1;
+                    == -1)
+                {
+                    dictReleaseIterator(di);
+                    return -1;
+                }
                 nwritten += n;
             }
             dictReleaseIterator(di);
@@ -747,7 +845,10 @@ ssize_t rdbSaveObject(rio *rdb, robj *o) {
             dictIterator *di = dictGetIterator(o->ptr);
             dictEntry *de;
 
-            if ((n = rdbSaveLen(rdb,dictSize((dict*)o->ptr))) == -1) return -1;
+            if ((n = rdbSaveLen(rdb,dictSize((dict*)o->ptr))) == -1) {
+                dictReleaseIterator(di);
+                return -1;
+            }
             nwritten += n;
 
             while((de = dictNext(di)) != NULL) {
@@ -755,10 +856,18 @@ ssize_t rdbSaveObject(rio *rdb, robj *o) {
                 sds value = dictGetVal(de);
 
                 if ((n = rdbSaveRawString(rdb,(unsigned char*)field,
-                        sdslen(field))) == -1) return -1;
+                        sdslen(field))) == -1)
+                {
+                    dictReleaseIterator(di);
+                    return -1;
+                }
                 nwritten += n;
                 if ((n = rdbSaveRawString(rdb,(unsigned char*)value,
-                        sdslen(value))) == -1) return -1;
+                        sdslen(value))) == -1)
+                {
+                    dictReleaseIterator(di);
+                    return -1;
+                }
                 nwritten += n;
             }
             dictReleaseIterator(di);
@@ -798,6 +907,43 @@ ssize_t rdbSaveObject(rio *rdb, robj *o) {
         nwritten += n;
         if ((n = rdbSaveLen(rdb,s->last_id.seq)) == -1) return -1;
         nwritten += n;
+
+        /* The consumer groups and their clients are part of the stream
+         * type, so serialize every consumer group. */
+
+        /* Save the number of groups. */
+        size_t num_cgroups = s->cgroups ? raxSize(s->cgroups) : 0;
+        if ((n = rdbSaveLen(rdb,num_cgroups)) == -1) return -1;
+        nwritten += n;
+
+        if (num_cgroups) {
+            /* Serialize each consumer group. */
+            raxStart(&ri,s->cgroups);
+            raxSeek(&ri,"^",NULL,0);
+            while(raxNext(&ri)) {
+                streamCG *cg = ri.data;
+
+                /* Save the group name. */
+                if ((n = rdbSaveRawString(rdb,ri.key,ri.key_len)) == -1)
+                    return -1;
+                nwritten += n;
+
+                /* Last ID. */
+                if ((n = rdbSaveLen(rdb,cg->last_id.ms)) == -1) return -1;
+                nwritten += n;
+                if ((n = rdbSaveLen(rdb,cg->last_id.seq)) == -1) return -1;
+                nwritten += n;
+
+                /* Save the global PEL. */
+                if ((n = rdbSaveStreamPEL(rdb,cg->pel,1)) == -1) return -1;
+                nwritten += n;
+
+                /* Save the consumers of this group. */
+                if ((n = rdbSaveStreamConsumers(rdb,cg)) == -1) return -1;
+                nwritten += n;
+            }
+            raxStop(&ri);
+        }
     } else if (o->type == OBJ_MODULE) {
         /* Save a module-specific value. */
         RedisModuleIO io;
@@ -842,15 +988,35 @@ size_t rdbSavedObjectLen(robj *o) {
  * On error -1 is returned.
  * On success if the key was actually saved 1 is returned, otherwise 0
  * is returned (the key was already expired). */
-int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val,
-                        long long expiretime, long long now)
+int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val, long long expiretime)
 {
+    int savelru = server.maxmemory_policy & MAXMEMORY_FLAG_LRU;
+    int savelfu = server.maxmemory_policy & MAXMEMORY_FLAG_LFU;
+
     /* Save the expire time */
     if (expiretime != -1) {
-        /* If this key is already expired skip it */
-        if (expiretime < now) return 0;
         if (rdbSaveType(rdb,RDB_OPCODE_EXPIRETIME_MS) == -1) return -1;
         if (rdbSaveMillisecondTime(rdb,expiretime) == -1) return -1;
+    }
+
+    /* Save the LRU info. */
+    if (savelru) {
+        int idletime = estimateObjectIdleTime(val);
+        idletime /= 1000; /* Using seconds is enough and requires less space.*/
+        if (rdbSaveType(rdb,RDB_OPCODE_IDLE) == -1) return -1;
+        if (rdbSaveLen(rdb,idletime) == -1) return -1;
+    }
+
+    /* Save the LFU info. */
+    if (savelfu) {
+        uint8_t buf[1];
+        buf[0] = LFUDecrAndReturn(val);
+        /* We can encode this in exactly two bytes: the opcode and an 8
+         * bit counter, since the frequency is logarithmic with a 0-255 range.
+         * Note that we do not store the halving time because to reset it
+         * a single time when loading does not affect the frequency much. */
+        if (rdbSaveType(rdb,RDB_OPCODE_FREQ) == -1) return -1;
+        if (rdbWriteRaw(rdb,buf,1) == -1) return -1;
     }
 
     /* Save type, key, value */
@@ -865,9 +1031,9 @@ ssize_t rdbSaveAuxField(rio *rdb, void *key, size_t keylen, void *val, size_t va
     ssize_t ret, len = 0;
     if ((ret = rdbSaveType(rdb,RDB_OPCODE_AUX)) == -1) return -1;
     len += ret;
-    if ((ret = rdbSaveRawString(rdb,key,keylen) == -1)) return -1;
+    if ((ret = rdbSaveRawString(rdb,key,keylen)) == -1) return -1;
     len += ret;
-    if ((ret = rdbSaveRawString(rdb,val,vallen) == -1)) return -1;
+    if ((ret = rdbSaveRawString(rdb,val,vallen)) == -1) return -1;
     len += ret;
     return len;
 }
@@ -922,7 +1088,6 @@ int rdbSaveRio(rio *rdb, int *error, int flags, rdbSaveInfo *rsi) {
     dictEntry *de;
     char magic[10];
     int j;
-    long long now = mstime();
     uint64_t cksum;
     size_t processed = 0;
 
@@ -937,7 +1102,6 @@ int rdbSaveRio(rio *rdb, int *error, int flags, rdbSaveInfo *rsi) {
         dict *d = db->dict;
         if (dictSize(d) == 0) continue;
         di = dictGetSafeIterator(d);
-        if (!di) return C_ERR;
 
         /* Write the SELECT DB opcode */
         if (rdbSaveType(rdb,RDB_OPCODE_SELECTDB) == -1) goto werr;
@@ -966,7 +1130,7 @@ int rdbSaveRio(rio *rdb, int *error, int flags, rdbSaveInfo *rsi) {
 
             initStaticStringObject(key,keystr);
             expire = getExpire(db,&key);
-            if (rdbSaveKeyValuePair(rdb,&key,o,expire,now) == -1) goto werr;
+            if (rdbSaveKeyValuePair(rdb,&key,o,expire) == -1) goto werr;
 
             /* When this RDB is produced as part of an AOF rewrite, move
              * accumulated diff from parent to child while rewriting in
@@ -979,8 +1143,8 @@ int rdbSaveRio(rio *rdb, int *error, int flags, rdbSaveInfo *rsi) {
             }
         }
         dictReleaseIterator(di);
+        di = NULL; /* So that we don't release it again on error. */
     }
-    di = NULL; /* So that we don't release it again on error. */
 
     /* If we are storing the replication information on disk, persist
      * the script cache as well: on successful PSYNC after a restart, we need
@@ -994,6 +1158,7 @@ int rdbSaveRio(rio *rdb, int *error, int flags, rdbSaveInfo *rsi) {
                 goto werr;
         }
         dictReleaseIterator(di);
+        di = NULL; /* So that we don't release it again on error. */
     }
 
     /* EOF opcode */
@@ -1487,13 +1652,89 @@ robj *rdbLoadObject(int rdbtype, rio *rdb) {
         /* Load the last entry ID. */
         s->last_id.ms = rdbLoadLen(rdb,NULL);
         s->last_id.seq = rdbLoadLen(rdb,NULL);
+
+        /* Consumer groups loading */
+        size_t cgroups_count = rdbLoadLen(rdb,NULL);
+        while(cgroups_count--) {
+            /* Get the consumer group name and ID. We can then create the
+             * consumer group ASAP and populate its structure as
+             * we read more data. */
+            streamID cg_id;
+            sds cgname = rdbGenericLoadStringObject(rdb,RDB_LOAD_SDS,NULL);
+            if (cgname == NULL) {
+                rdbExitReportCorruptRDB(
+                    "Error reading the consumer group name from Stream");
+            }
+            cg_id.ms = rdbLoadLen(rdb,NULL);
+            cg_id.seq = rdbLoadLen(rdb,NULL);
+            streamCG *cgroup = streamCreateCG(s,cgname,sdslen(cgname),&cg_id);
+            if (cgroup == NULL)
+                rdbExitReportCorruptRDB("Duplicated consumer group name %s",
+                                         cgname);
+            sdsfree(cgname);
+
+            /* Load the global PEL for this consumer group, however we'll
+             * not yet populate the NACK structures with the message
+             * owner, since consumers for this group and their messages will
+             * be read as a next step. So for now leave them not resolved
+             * and later populate it. */
+            size_t pel_size = rdbLoadLen(rdb,NULL);
+            while(pel_size--) {
+                unsigned char rawid[sizeof(streamID)];
+                rdbLoadRaw(rdb,rawid,sizeof(rawid));
+                streamNACK *nack = streamCreateNACK(NULL);
+                nack->delivery_time = rdbLoadMillisecondTime(rdb);
+                nack->delivery_count = rdbLoadLen(rdb,NULL);
+                if (!raxInsert(cgroup->pel,rawid,sizeof(rawid),nack,NULL))
+                    rdbExitReportCorruptRDB("Duplicated gobal PEL entry "
+                                            "loading stream consumer group");
+            }
+
+            /* Now that we loaded our global PEL, we need to load the
+             * consumers and their local PELs. */
+            size_t consumers_num = rdbLoadLen(rdb,NULL);
+            while(consumers_num--) {
+                sds cname = rdbGenericLoadStringObject(rdb,RDB_LOAD_SDS,NULL);
+                if (cname == NULL) {
+                    rdbExitReportCorruptRDB(
+                        "Error reading the consumer name from Stream group");
+                }
+                streamConsumer *consumer = streamLookupConsumer(cgroup,cname,
+                                           1);
+                sdsfree(cname);
+                consumer->seen_time = rdbLoadMillisecondTime(rdb);
+
+                /* Load the PEL about entries owned by this specific
+                 * consumer. */
+                pel_size = rdbLoadLen(rdb,NULL);
+                while(pel_size--) {
+                    unsigned char rawid[sizeof(streamID)];
+                    rdbLoadRaw(rdb,rawid,sizeof(rawid));
+                    streamNACK *nack = raxFind(cgroup->pel,rawid,sizeof(rawid));
+                    if (nack == raxNotFound)
+                        rdbExitReportCorruptRDB("Consumer entry not found in "
+                                                "group global PEL");
+
+                    /* Set the NACK consumer, that was left to NULL when
+                     * loading the global PEL. Then set the same shared
+                     * NACK structure also in the consumer-specific PEL. */
+                    nack->consumer = consumer;
+                    if (!raxInsert(consumer->pel,rawid,sizeof(rawid),nack,NULL))
+                        rdbExitReportCorruptRDB("Duplicated consumer PEL entry "
+                                                " loading a stream consumer "
+                                                "group");
+                }
+            }
+        }
     } else if (rdbtype == RDB_TYPE_MODULE || rdbtype == RDB_TYPE_MODULE_2) {
         uint64_t moduleid = rdbLoadLen(rdb,NULL);
         moduleType *mt = moduleTypeLookupModuleByID(moduleid);
         char name[10];
 
-        if (rdbCheckMode && rdbtype == RDB_TYPE_MODULE_2)
+        if (rdbCheckMode && rdbtype == RDB_TYPE_MODULE_2) {
+            moduleTypeNameByID(name,moduleid);
             return rdbLoadCheckModuleValue(rdb,name);
+        }
 
         if (mt == NULL) {
             moduleTypeNameByID(name,moduleid);
@@ -1581,12 +1822,11 @@ void rdbLoadProgressCallback(rio *r, const void *buf, size_t len) {
 
 /* Load an RDB file from the rio stream 'rdb'. On success C_OK is returned,
  * otherwise C_ERR is returned and 'errno' is set accordingly. */
-int rdbLoadRio(rio *rdb, rdbSaveInfo *rsi) {
+int rdbLoadRio(rio *rdb, rdbSaveInfo *rsi, int loading_aof) {
     uint64_t dbid;
     int type, rdbver;
     redisDb *db = server.db+0;
     char buf[1024];
-    long long expiretime, now = mstime();
 
     rdb->update_cksum = rdbLoadProgressCallback;
     rdb->max_processing_chunk = server.loading_process_events_interval_bytes;
@@ -1604,9 +1844,14 @@ int rdbLoadRio(rio *rdb, rdbSaveInfo *rsi) {
         return C_ERR;
     }
 
+    /* Key-specific attributes, set by opcodes before the key type. */
+    long long expiretime = -1, now = mstime();
+    long long lru_clock = LRU_CLOCK();
+    uint64_t lru_idle = -1;
+    int lfu_freq = -1;
+
     while(1) {
         robj *key, *val;
-        expiretime = -1;
 
         /* Read type. */
         if ((type = rdbLoadType(rdb)) == -1) goto eoferr;
@@ -1616,25 +1861,30 @@ int rdbLoadRio(rio *rdb, rdbSaveInfo *rsi) {
             /* EXPIRETIME: load an expire associated with the next key
              * to load. Note that after loading an expire we need to
              * load the actual type, and continue. */
-            if ((expiretime = rdbLoadTime(rdb)) == -1) goto eoferr;
-            /* We read the time so we need to read the object type again. */
-            if ((type = rdbLoadType(rdb)) == -1) goto eoferr;
-            /* the EXPIRETIME opcode specifies time in seconds, so convert
-             * into milliseconds. */
+            expiretime = rdbLoadTime(rdb);
             expiretime *= 1000;
+            continue; /* Read next opcode. */
         } else if (type == RDB_OPCODE_EXPIRETIME_MS) {
             /* EXPIRETIME_MS: milliseconds precision expire times introduced
              * with RDB v3. Like EXPIRETIME but no with more precision. */
-            if ((expiretime = rdbLoadMillisecondTime(rdb)) == -1) goto eoferr;
-            /* We read the time so we need to read the object type again. */
-            if ((type = rdbLoadType(rdb)) == -1) goto eoferr;
+            expiretime = rdbLoadMillisecondTime(rdb);
+            continue; /* Read next opcode. */
+        } else if (type == RDB_OPCODE_FREQ) {
+            /* FREQ: LFU frequency. */
+            uint8_t byte;
+            if (rioRead(rdb,&byte,1) == 0) goto eoferr;
+            lfu_freq = byte;
+            continue; /* Read next opcode. */
+        } else if (type == RDB_OPCODE_IDLE) {
+            /* IDLE: LRU idle time. */
+            if ((lru_idle = rdbLoadLen(rdb,NULL)) == RDB_LENERR) goto eoferr;
+            continue; /* Read next opcode. */
         } else if (type == RDB_OPCODE_EOF) {
             /* EOF: End of file, exit the main loop. */
             break;
         } else if (type == RDB_OPCODE_SELECTDB) {
             /* SELECTDB: Select the specified database. */
-            if ((dbid = rdbLoadLen(rdb,NULL)) == RDB_LENERR)
-                goto eoferr;
+            if ((dbid = rdbLoadLen(rdb,NULL)) == RDB_LENERR) goto eoferr;
             if (dbid >= (unsigned)server.dbnum) {
                 serverLog(LL_WARNING,
                     "FATAL: Data file was created with a Redis "
@@ -1643,7 +1893,7 @@ int rdbLoadRio(rio *rdb, rdbSaveInfo *rsi) {
                 exit(1);
             }
             db = server.db+dbid;
-            continue; /* Read type again. */
+            continue; /* Read next opcode. */
         } else if (type == RDB_OPCODE_RESIZEDB) {
             /* RESIZEDB: Hint about the size of the keys in the currently
              * selected data base, in order to avoid useless rehashing. */
@@ -1654,7 +1904,7 @@ int rdbLoadRio(rio *rdb, rdbSaveInfo *rsi) {
                 goto eoferr;
             dictExpand(db->dict,db_size);
             dictExpand(db->expires,expires_size);
-            continue; /* Read type again. */
+            continue; /* Read next opcode. */
         } else if (type == RDB_OPCODE_AUX) {
             /* AUX: generic string-string fields. Use to add state to RDB
              * which is backward compatible. Implementations of RDB loading
@@ -1698,6 +1948,34 @@ int rdbLoadRio(rio *rdb, rdbSaveInfo *rsi) {
             decrRefCount(auxkey);
             decrRefCount(auxval);
             continue; /* Read type again. */
+        } else if (type == RDB_OPCODE_MODULE_AUX) {
+            /* This is just for compatibility with the future: we have plans
+             * to add the ability for modules to store anything in the RDB
+             * file, like data that is not related to the Redis key space.
+             * Such data will potentially be stored both before and after the
+             * RDB keys-values section. For this reason since RDB version 9,
+             * we have the ability to read a MODULE_AUX opcode followed by an
+             * identifier of the module, and a serialized value in "MODULE V2"
+             * format. */
+            uint64_t moduleid = rdbLoadLen(rdb,NULL);
+            moduleType *mt = moduleTypeLookupModuleByID(moduleid);
+            char name[10];
+            moduleTypeNameByID(name,moduleid);
+
+            if (!rdbCheckMode && mt == NULL) {
+                /* Unknown module. */
+                serverLog(LL_WARNING,"The RDB file contains AUX module data I can't load: no matching module '%s'", name);
+                exit(1);
+            } else if (!rdbCheckMode && mt != NULL) {
+                /* This version of Redis actually does not know what to do
+                 * with modules AUX data... */
+                serverLog(LL_WARNING,"The RDB file contains AUX module data I can't load for the module '%s'. Probably you want to use a newer version of Redis which implements aux data callbacks", name);
+                exit(1);
+            } else {
+                /* RDB check mode. */
+                robj *aux = rdbLoadCheckModuleValue(rdb,name);
+                decrRefCount(aux);
+            }
         }
 
         /* Read key */
@@ -1709,30 +1987,54 @@ int rdbLoadRio(rio *rdb, rdbSaveInfo *rsi) {
          * received from the master. In the latter case, the master is
          * responsible for key expiry. If we would expire keys here, the
          * snapshot taken by the master may not be reflected on the slave. */
-        if (server.masterhost == NULL && expiretime != -1 && expiretime < now) {
+        if (server.masterhost == NULL && !loading_aof && expiretime != -1 && expiretime < now) {
             decrRefCount(key);
             decrRefCount(val);
-            continue;
+        } else {
+            /* Add the new object in the hash table */
+            dbAdd(db,key,val);
+
+            /* Set the expire time if needed */
+            if (expiretime != -1) setExpire(NULL,db,key,expiretime);
+            if (lfu_freq != -1) {
+                val->lru = (LFUGetTimeInMinutes()<<8) | lfu_freq;
+            } else {
+                /* LRU idle time loaded from RDB is in seconds. Scale
+                 * according to the LRU clock resolution this Redis
+                 * instance was compiled with (normaly 1000 ms, so the
+                 * below statement will expand to lru_idle*1000/1000. */
+                lru_idle = lru_idle*1000/LRU_CLOCK_RESOLUTION;
+                val->lru = lru_clock - lru_idle;
+                /* If the lru field overflows (since LRU it is a wrapping
+                 * clock), the best we can do is to provide the maxium
+                 * representable idle time. */
+                if (val->lru < 0) val->lru = lru_clock+1;
+            }
+
+            /* Decrement the key refcount since dbAdd() will take its
+             * own reference. */
+            decrRefCount(key);
         }
-        /* Add the new object in the hash table */
-        dbAdd(db,key,val);
 
-        /* Set the expire time if needed */
-        if (expiretime != -1) setExpire(NULL,db,key,expiretime);
-
-        decrRefCount(key);
+        /* Reset the state that is key-specified and is populated by
+         * opcodes before the key, so that we start from scratch again. */
+        expiretime = -1;
+        lfu_freq = -1;
+        lru_idle = -1;
     }
     /* Verify the checksum if RDB version is >= 5 */
-    if (rdbver >= 5 && server.rdb_checksum) {
+    if (rdbver >= 5) {
         uint64_t cksum, expected = rdb->cksum;
 
         if (rioRead(rdb,&cksum,8) == 0) goto eoferr;
-        memrev64ifbe(&cksum);
-        if (cksum == 0) {
-            serverLog(LL_WARNING,"RDB file was saved with checksum disabled: no check performed.");
-        } else if (cksum != expected) {
-            serverLog(LL_WARNING,"Wrong RDB checksum. Aborting now.");
-            rdbExitReportCorruptRDB("RDB CRC error");
+        if (server.rdb_checksum) {
+            memrev64ifbe(&cksum);
+            if (cksum == 0) {
+                serverLog(LL_WARNING,"RDB file was saved with checksum disabled: no check performed.");
+            } else if (cksum != expected) {
+                serverLog(LL_WARNING,"Wrong RDB checksum. Aborting now.");
+                rdbExitReportCorruptRDB("RDB CRC error");
+            }
         }
     }
     return C_OK;
@@ -1758,7 +2060,7 @@ int rdbLoad(char *filename, rdbSaveInfo *rsi) {
     if ((fp = fopen(filename,"r")) == NULL) return C_ERR;
     startLoading(fp);
     rioInitWithFile(&rdb,fp);
-    retval = rdbLoadRio(&rdb,rsi);
+    retval = rdbLoadRio(&rdb,rsi,0);
     fclose(fp);
     stopLoading();
     return retval;

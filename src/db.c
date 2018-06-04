@@ -169,7 +169,9 @@ void dbAdd(redisDb *db, robj *key, robj *val) {
     int retval = dictAdd(db->dict, copy, val);
 
     serverAssertWithInfo(NULL,key,retval == DICT_OK);
-    if (val->type == OBJ_LIST) signalKeyAsReady(db, key);
+    if (val->type == OBJ_LIST ||
+        val->type == OBJ_ZSET)
+        signalKeyAsReady(db, key);
     if (server.cluster_enabled) slotToKeyAdd(key);
 }
 
@@ -187,9 +189,6 @@ void dbOverwrite(redisDb *db, robj *key, robj *val) {
         int saved_lru = old->lru;
         dictReplace(db->dict, key->ptr, val);
         val->lru = saved_lru;
-        /* LFU should be not only copied but also updated
-         * when a key is overwritten. */
-        updateLFU(val);
     } else {
         dictReplace(db->dict, key->ptr, val);
     }
@@ -1095,6 +1094,25 @@ void propagateExpire(redisDb *db, robj *key, int lazy) {
     decrRefCount(argv[1]);
 }
 
+/* This function is called when we are going to perform some operation
+ * in a given key, but such key may be already logically expired even if
+ * it still exists in the database. The main way this function is called
+ * is via lookupKey*() family of functions.
+ *
+ * The behavior of the function depends on the replication role of the
+ * instance, because slave instances do not expire keys, they wait
+ * for DELs from the master for consistency matters. However even
+ * slaves will try to have a coherent return value for the function,
+ * so that read commands executed in the slave side will be able to
+ * behave like if the key is expired even if still present (because the
+ * master has yet to propagate the DEL).
+ *
+ * In masters as a side effect of finding a key which is expired, such
+ * key will be evicted from the database. Also this may trigger the
+ * propagation of a DEL/UNLINK command in AOF / replication stream.
+ *
+ * The return value of the function is 0 if the key is still valid,
+ * otherwise the function returns 1 if the key is expired. */
 int expireIfNeeded(redisDb *db, robj *key) {
     mstime_t when = getExpire(db,key);
     mstime_t now;
@@ -1104,7 +1122,7 @@ int expireIfNeeded(redisDb *db, robj *key) {
     /* Don't expire anything while loading. It will be done later. */
     if (server.loading) return 0;
 
-    /* If we are in the context of a Lua script, we claim that time is
+    /* If we are in the context of a Lua script, we pretend that time is
      * blocked to when the Lua script started. This way a key can expire
      * only the first time it is accessed and not in the middle of the
      * script execution, making propagation to slaves / AOF consistent.
@@ -1340,7 +1358,7 @@ int *georadiusGetKeys(struct redisCommand *cmd, robj **argv, int argc, int *numk
     for (i = 5; i < argc; i++) {
         char *arg = argv[i]->ptr;
         /* For the case when user specifies both "store" and "storedist" options, the
-         * second key specified would override the first key. This behavior is kept 
+         * second key specified would override the first key. This behavior is kept
          * the same as in georadiusCommand method.
          */
         if ((!strcasecmp(arg, "store") || !strcasecmp(arg, "storedist")) && ((i+1) < argc)) {
@@ -1361,7 +1379,7 @@ int *georadiusGetKeys(struct redisCommand *cmd, robj **argv, int argc, int *numk
     if(num > 1) {
          keys[1] = stored_key;
     }
-    *numkeys = num; 
+    *numkeys = num;
     return keys;
 }
 

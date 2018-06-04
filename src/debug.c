@@ -287,7 +287,7 @@ void debugCommand(client *c) {
         const char *help[] = {
 "assert -- Crash by assertion failed.",
 "change-repl-id -- Change the replication IDs of the instance. Dangerous, should be used only for testing the replication subsystem.",
-"crash-and-recovery <milliseconds> -- Hard crash and restart after <milliseconds> delay.",
+"crash-and-recover <milliseconds> -- Hard crash and restart after <milliseconds> delay.",
 "digest -- Outputs an hex signature representing the current DB content.",
 "htstats <dbid> -- Return hash table statistics of the specified Redis database.",
 "loadaof -- Flush the AOF buffers on disk and reload the AOF in memory.",
@@ -688,6 +688,8 @@ static void *getMcontextEip(ucontext_t *uc) {
     return (void*) uc->uc_mcontext.sc_ip;
     #elif defined(__arm__) /* Linux ARM */
     return (void*) uc->uc_mcontext.arm_pc;
+    #elif defined(__aarch64__) /* Linux AArch64 */
+    return (void*) uc->uc_mcontext.pc;
     #endif
 #else
     return NULL;
